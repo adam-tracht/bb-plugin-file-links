@@ -16,6 +16,9 @@
 //
 // DOM contract relied on (verified against BB 0.46.1):
 // - Each timeline row root carries `data-timeline-row-id="<threadId>:..."`.
+//   File rows look like "<threadId>:command:<itemId>" (shell reads) or
+//   "<threadId>:file-read:<itemId>"; the item id lets the backend find the
+//   producing command's cwd and leading `cd`.
 // - Its headline is a `span[title]` whose title is the row's plain text, for
 //   example "Read file /abs/path.png" or "Viewed image: rel/path.png", and
 //   whose last child span shows the basename.
@@ -36,11 +39,13 @@ const STYLE_ID = "bb-file-links-styles";
 const LINK_ATTR = "data-bb-file-links-link";
 const THUMB_ATTR = "data-bb-file-links-thumb";
 const OWNED_ATTR = "data-bb-file-links-owned";
+const MISSING_ATTR = "data-bb-file-links-missing";
 
 const ROW_SELECTOR = "[data-timeline-row-id]";
 // Longest prefixes first so "Read file x" is not parsed as "Read" + "file x".
 const HEADLINE_PATTERN =
   /^(Read file|Reading file|Viewed image:|Viewing image:|Read|Reading)\s+(.+)$/;
+const ROW_ITEM_PATTERN = /^thr_[A-Za-z0-9_]+:[a-z-]+:([A-Za-z0-9_-]{1,120})(?::|$)/;
 const SETTLED_PREFIXES = new Set(["Read file", "Read", "Viewed image:"]);
 const IMAGE_PATTERN = /\.(?:png|jpe?g|gif|webp|svg|bmp)$/i;
 
@@ -53,6 +58,8 @@ interface NavigateDetail {
 
 interface LinkInfo {
   threadId: string;
+  /** Timeline item that produced the row, when the row id carries one. */
+  itemId: string | null;
   path: string;
   isImage: boolean;
 }
@@ -70,6 +77,14 @@ const styles = `
     text-decoration-style: solid;
     text-decoration-color: currentColor;
     outline: none;
+  }
+  [${LINK_ATTR}][${MISSING_ATTR}],
+  [${LINK_ATTR}][${MISSING_ATTR}]:hover {
+    cursor: default;
+    text-decoration-line: line-through;
+    text-decoration-style: solid;
+    text-decoration-color: color-mix(in srgb, currentColor 35%, transparent);
+    opacity: 0.6;
   }
   .bb-file-links-thumb-wrap {
     display: block;
@@ -228,6 +243,10 @@ function basename(filePath: string): string {
   return trimmed.slice(trimmed.lastIndexOf("/") + 1);
 }
 
+function itemIdForRow(row: Element): string | null {
+  return ROW_ITEM_PATTERN.exec(row.getAttribute("data-timeline-row-id") ?? "")?.[1] ?? null;
+}
+
 function threadIdForRow(row: Element): string | null {
   const fromRow = row.getAttribute("data-timeline-row-id")?.split(":")[0] ?? "";
   if (/^thr_[A-Za-z0-9_]+$/.test(fromRow)) return fromRow;
@@ -267,6 +286,7 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
 
   function imageUrl(info: LinkInfo): string {
     const query = new URLSearchParams({ threadId: info.threadId, path: info.path });
+    if (info.itemId) query.set("itemId", info.itemId);
     return `/api/v1/plugins/${encodeURIComponent(pluginId)}/http/image?${query}`;
   }
 
@@ -285,11 +305,17 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
     }
   }
 
+  function lookupInput(info: LinkInfo) {
+    return { threadId: info.threadId, path: info.path, ...(info.itemId ? { itemId: info.itemId } : {}) };
+  }
+
+  // One lookup per row (thread + item + path), so virtualized rows that
+  // remount while scrolling reuse it.
   function resolve(info: LinkInfo): Promise<ResolvedFile | null> {
-    const key = `${info.threadId}\n${info.path}`;
+    const key = `${info.threadId}\n${info.itemId ?? ""}\n${info.path}`;
     let pending = resolutions.get(key);
     if (!pending) {
-      pending = rpc<ResolvedFile>("resolve", { threadId: info.threadId, path: info.path });
+      pending = rpc<ResolvedFile>("resolve", lookupInput(info));
       resolutions.set(key, pending);
       // Failed lookups are retried on the next interaction.
       void pending.then((result) => {
@@ -316,6 +342,10 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
       toast.error(`Could not locate ${basename(info.path)}`);
       return;
     }
+    if (!resolved.exists) {
+      toast.error("File not found", { description: resolved.absolutePath });
+      return;
+    }
     if (navigate("preview", info.threadId, resolved.target)) return;
     if (info.isImage) {
       openLightbox(info);
@@ -327,6 +357,10 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
   async function openExternally(info: LinkInfo) {
     const resolved = await resolve(info);
     if (signal.aborted) return;
+    if (resolved && !resolved.exists) {
+      toast.error("File not found", { description: resolved.absolutePath });
+      return;
+    }
     if (!resolved || !navigate("external", info.threadId, resolved.target)) {
       toast.error(`Could not open ${basename(info.path)}`);
     }
@@ -342,7 +376,7 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
   }
 
   async function reveal(info: LinkInfo) {
-    const result = await rpc<{ revealed: boolean }>("reveal", { threadId: info.threadId, path: info.path });
+    const result = await rpc<{ revealed: boolean }>("reveal", lookupInput(info));
     if (!signal.aborted && !result?.revealed) toast.error("Could not reveal the file in Finder");
   }
 
@@ -366,13 +400,15 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
     pathLine.textContent = info.path;
     root.appendChild(pathLine);
 
+    // Everything except Copy waits for the lookup and needs an existing file.
+    const exists = (r: ResolvedFile | null) => r?.exists === true;
     const items: Array<{ label: string; run: () => void; when?: (r: ResolvedFile | null) => boolean }> = [
-      { label: "Open preview", run: () => void openPreview(info) },
-      { label: "Open in default app", run: () => void openExternally(info) },
+      { label: "Open preview", run: () => void openPreview(info), when: exists },
+      { label: "Open in default app", run: () => void openExternally(info), when: exists },
       { label: "Copy full path", run: () => void copyPath(info) },
       { label: "Reveal in Finder", run: () => void reveal(info), when: (r) => r?.canReveal === true },
     ];
-    if (info.isImage) items.splice(1, 0, { label: "View image", run: () => openLightbox(info) });
+    if (info.isImage) items.splice(1, 0, { label: "View image", run: () => openLightbox(info), when: exists });
 
     const buttons: HTMLButtonElement[] = [];
     const revealButtons = new Map<HTMLButtonElement, (r: ResolvedFile | null) => boolean>();
@@ -399,7 +435,7 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
     const rect = root.getBoundingClientRect();
     root.style.left = `${Math.max(4, Math.min(x, window.innerWidth - rect.width - 4))}px`;
     root.style.top = `${Math.max(4, Math.min(y, window.innerHeight - rect.height - 4))}px`;
-    buttons[0]?.focus();
+    buttons.find((button) => !button.hidden)?.focus();
 
     menuAbort = new AbortController();
     const menuSignal = AbortSignal.any([signal, menuAbort.signal]);
@@ -435,7 +471,9 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
     const resolved = await resolve(info);
     if (menu !== root) return;
     pathLine.textContent = resolved?.absolutePath ?? info.path;
+    if (resolved && !resolved.exists) pathLine.textContent += " (not found)";
     for (const [button, when] of revealButtons) button.hidden = !when(resolved);
+    buttons.find((button) => !button.hidden)?.focus();
   }
 
   // Lightbox ------------------------------------------------------------
@@ -546,13 +584,32 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
         if (headline.closest(ROW_SELECTOR) !== row) continue;
         const parsed = parseHeadline(headline);
         if (!parsed) continue;
-        const info: LinkInfo = { threadId, path: parsed.path, isImage: IMAGE_PATTERN.test(parsed.path) };
+        const info: LinkInfo = {
+          threadId,
+          itemId: itemIdForRow(row),
+          path: parsed.path,
+          isImage: IMAGE_PATTERN.test(parsed.path),
+        };
         const existing = links.get(parsed.name);
-        if (!existing || existing.path !== info.path || existing.threadId !== threadId) {
-          links.set(parsed.name, info);
-          parsed.name.setAttribute(LINK_ATTR, "true");
-          parsed.name.setAttribute("role", "link");
-          parsed.name.setAttribute("tabindex", "0");
+        if (
+          !existing ||
+          existing.path !== info.path ||
+          existing.threadId !== threadId ||
+          existing.itemId !== info.itemId
+        ) {
+          const name = parsed.name;
+          links.set(name, info);
+          name.setAttribute(LINK_ATTR, "true");
+          name.setAttribute("role", "link");
+          name.setAttribute("tabindex", "0");
+          name.removeAttribute(MISSING_ATTR);
+          name.removeAttribute("aria-disabled");
+          // Mute names whose file is gone; the menu still offers Copy path.
+          void resolve(info).then((resolved) => {
+            if (signal.aborted || links.get(name) !== info || !resolved || resolved.exists) return;
+            name.setAttribute(MISSING_ATTR, "true");
+            name.setAttribute("aria-disabled", "true");
+          });
         }
         if (info.isImage && SETTLED_PREFIXES.has(parsed.prefix)) thumbFor = info;
         break;
@@ -624,6 +681,7 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
     (event) => {
       const hit = linkFromEvent(event);
       if (!hit || event.button !== 0) return;
+      if (hit.element.hasAttribute(MISSING_ATTR)) return;
       event.preventDefault();
       event.stopPropagation();
       if (hit.element.tagName === "IMG") openLightbox(hit.info);
@@ -637,7 +695,7 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
     (event) => {
       if (event.key !== "Enter" && event.key !== " ") return;
       const hit = linkFromEvent(event);
-      if (!hit) return;
+      if (!hit || hit.element.hasAttribute(MISSING_ATTR)) return;
       event.preventDefault();
       event.stopPropagation();
       if (hit.element.tagName === "IMG") openLightbox(hit.info);
@@ -664,6 +722,8 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
     closeLightbox();
     for (const element of document.querySelectorAll(`[${LINK_ATTR}]`)) {
       element.removeAttribute(LINK_ATTR);
+      element.removeAttribute(MISSING_ATTR);
+      element.removeAttribute("aria-disabled");
       element.removeAttribute("role");
       element.removeAttribute("tabindex");
     }

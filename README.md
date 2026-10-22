@@ -12,7 +12,13 @@ Makes file rows in the BB thread timeline useful. Targets rows like
 - **Image rows** (png, jpg, jpeg, gif, webp, svg, bmp) get a small thumbnail
   under the row. Click it for a lightbox; Escape or a backdrop click closes
   it. Styles match the Dwite image-preview plugin.
-- Relative paths resolve against the thread's environment folder.
+- **Relative paths resolve where the command actually ran.** Candidates, in
+  order: the folder after the command's leading `cd` steps, the command's
+  recorded cwd, then the thread's environment folder. The first one where the
+  file exists wins. Absolute paths are used as-is.
+- **Missing files** show muted (struck through, not clickable). The menu
+  offers only Copy full path, labeled "(not found)". The preview never opens
+  for a missing file.
 - Images inside chat messages are left alone (image-preview handles those).
 
 ## How it works
@@ -27,18 +33,35 @@ Makes file rows in the BB thread timeline useful. Targets rows like
   the matching thread opens the file. If no bridge answers, images fall back
   to the lightbox and other files show a toast.
 - `server.ts` provides:
-  - RPC `resolve` (thread + path to absolute path, preview target, image flag,
-    whether Finder reveal is possible) and RPC `reveal` (`open -R`, no shell).
-  - `GET /api/v1/plugins/file-links/http/image?threadId=&path=` for thumbnail
-    bytes. Local auth only. Paths are untrusted: NUL bytes and URLs are
+  - RPC `resolve` (thread + item id + path to absolute path, preview target,
+    image flag, `exists`, whether Finder reveal is possible) and RPC `reveal`
+    (`open -R`, no shell). Results are cached per row for 30 seconds.
+  - `GET /api/v1/plugins/file-links/http/image?threadId=&itemId=&path=` for
+    thumbnail bytes (404 when the file is missing). Local auth only. Paths are untrusted: NUL bytes and URLs are
     rejected, paths are normalized, only image extensions are served (415
     otherwise), and files over 20 MB get 413. Responses carry `nosniff` and a
     sandbox CSP.
 
+## Path resolution
+
+- The item id comes from the row id (see below). `server.ts` reads the
+  thread's `item/started` events through `bb.sdk.threads.events.list` (pages
+  of 100, the API maximum) and keeps each item's `command` and `cwd`. Unknown
+  items trigger a refresh at most every 2 seconds.
+- `shell-cwd.ts` works out the effective folder: it unwraps
+  `/bin/zsh -lc '...'` style wrappers (sh, bash, zsh, dash, ksh), then follows
+  leading `cd`/`pushd` segments joined by `&&` or `;`. It handles quotes, `~`,
+  `$HOME`, and relative `cd`. It stops at anything it cannot know: other
+  variables, globs, `cd -`, or a `cd` that is piped or backgrounded.
+- Existence: `stat` when the thread runs on this Mac, otherwise a
+  `bb.sdk.files.read` probe.
+
 ## DOM hooks (fragile; recheck after BB upgrades)
 
 - Row root: `[data-timeline-row-id="<threadId>:..."]`. The thread id is the
-  part before the first colon (falls back to the URL).
+  part before the first colon (falls back to the URL). Shell reads look like
+  `<threadId>:command:<itemId>`, Claude Code reads like
+  `<threadId>:file-read:<itemId>`; the third part is the item id.
 - Group rows ("Explored N files") are rows that contain nested rows; only a
   row's own headline is decorated, so groups never get a thumbnail.
 - Headline: a `span[title]` whose title matches

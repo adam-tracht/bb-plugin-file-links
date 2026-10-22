@@ -18,6 +18,7 @@
   },
   "include": [
     "server.ts",
+    "shell-cwd.ts",
     "app.tsx"
   ]
 }
