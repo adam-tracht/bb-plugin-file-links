@@ -5,8 +5,8 @@ description: How the file-links BB plugin decorates timeline file rows (clickabl
 
 # file-links
 
-Source: `bb-plugin-file-links/` in the bb-plugins repo. Full detail in its
-README.
+Source: https://github.com/adam-tracht/bb-plugin-file-links (local clone:
+`~/Documents/GitHub/bb-plugin-file-links`). Full detail in its README.
 
 - Content script in `app.tsx` scans `[data-timeline-row-id]` rows. A row's own
   `span[title]` headline ("Read file <path>", "Viewed image: <path>") must end
