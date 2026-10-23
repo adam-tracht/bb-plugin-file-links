@@ -1,7 +1,10 @@
 # File Links (`file-links`)
 
 Makes file rows in the BB thread timeline useful. Targets rows like
-"Read file X.png", "Read src/foo.ts", and "Viewed image: X.png".
+"Read file X.png", "Read src/foo.ts", and "Viewed image: X.png", skill reads
+("Read bb-plugin-authoring/SKILL.md" in Codex, "Loaded skill aside-browser"
+in Claude Code), and the folder or file in search and list rows ("Searched
+for X in src/lib", "Listed files in ~/.bb").
 
 - **Click the file name** to open it in BB's side-panel preview.
   Cmd/Ctrl-click opens it in the default app. Enter or Space works when the
@@ -13,12 +16,35 @@ Makes file rows in the BB thread timeline useful. Targets rows like
   under the row. Click it for a lightbox; Escape or a backdrop click closes
   it. Styles match the Dwite image-preview plugin.
 - **Relative paths resolve where the command actually ran.** Candidates, in
-  order: the folder after the command's leading `cd` steps, the command's
+  order: each folder the command `cd`s into (every top-level `cd` in the
+  chain, in order), the command's
   recorded cwd, then the thread's environment folder. The first one where the
   file exists wins. Absolute paths are used as-is.
 - **Missing files** show muted (struck through, not clickable). The menu
   offers only Copy full path, labeled "(not found)". The preview never opens
   for a missing file.
+- **Skill rows open the SKILL.md that was actually read.**
+  - Codex shows a shortened path ("bb-orchestration/SKILL.md") while the row
+    title keeps the full path, so the link uses that full path.
+  - Claude Code's Skill call records only the skill name. The plugin reads
+    the producing Claude session's transcript
+    (`~/.claude/projects/*/<session>.jsonl`, or under `CLAUDE_CONFIG_DIR`)
+    and takes the "Base directory for this skill" line that answered that
+    call, matching the Nth call for a name to the Nth transcript call. It
+    never guesses from the name alone; if the transcript is gone or the
+    thread runs on another machine, the row stays plain text.
+  - BB's global skills folder (`~/.bb/runtime/global-skills/<hash>/`)
+    changes hash over time. When the recorded copy is gone, the same file
+    under the newest other hash is used. Bundled plugin skills that Claude
+    Code read from a temp folder show as missing once that folder is deleted.
+- **Folder names in search and list rows** are links too. Click opens the
+  folder in Finder; the menu offers Open folder, Copy full path, Reveal in
+  Finder. If the target is a file, it behaves like any file link. The query
+  text is never touched. Targets with glob characters (`*.md`, `qbo*`) stay
+  plain. When the query itself contains " in ", each possible split is
+  checked and the first one that exists wins. Folders only open when the
+  thread runs on this Mac; on a remote machine a folder cannot be checked
+  for existence, so it is assumed to exist.
 - Images inside chat messages are left alone (image-preview handles those).
 
 ## How it works
@@ -34,8 +60,12 @@ Makes file rows in the BB thread timeline useful. Targets rows like
   to the lightbox and other files show a toast.
 - `server.ts` provides:
   - RPC `resolve` (thread + item id + path to absolute path, preview target,
-    image flag, `exists`, whether Finder reveal is possible) and RPC `reveal`
-    (`open -R`, no shell). Results are cached per row for 30 seconds.
+    image flag, `exists`, `isDirectory`, whether Finder reveal is possible)
+    and RPC `reveal` (`open -R`, no shell). `resolve` takes an optional
+    `kind`: `file` (default), `path` (a file or folder from a search or list
+    row), or `skill` (a Claude Code "Loaded skill" row; `path` is the skill
+    name). `reveal` takes the same `kind` plus `open: true` to open a folder
+    instead of revealing it. Results are cached per row for 30 seconds.
   - `GET /api/v1/plugins/file-links/http/image?threadId=&itemId=&path=` for
     thumbnail bytes (404 when the file is missing). Local auth only. Paths are untrusted: NUL bytes and URLs are
     rejected, paths are normalized, only image extensions are served (415
@@ -50,7 +80,11 @@ Makes file rows in the BB thread timeline useful. Targets rows like
   items trigger a refresh at most every 2 seconds.
 - `shell-cwd.ts` works out the effective folder: it unwraps
   `/bin/zsh -lc '...'` style wrappers (sh, bash, zsh, dash, ksh), then follows
-  leading `cd`/`pushd` segments joined by `&&` or `;`. It handles quotes, `~`,
+  every top-level `cd`/`pushd` joined by `&&`, `||`, or `;`, including ones
+  after other commands (`git log; cd ../x; grep ...`). Each distinct folder is
+  a candidate. A `cd` inside parentheses or on either side of a pipe is
+  skipped. Claude Code rows record an empty cwd, so their `cd` steps start
+  from the environment folder. It handles quotes, `~`,
   `$HOME`, and relative `cd`. It stops at anything it cannot know: other
   variables, globs, `cd -`, or a `cd` that is piped or backgrounded.
 - Existence: `stat` when the thread runs on this Mac, otherwise a
@@ -66,8 +100,19 @@ Makes file rows in the BB thread timeline useful. Targets rows like
   row's own headline is decorated, so groups never get a thumbnail.
 - Headline: a `span[title]` whose title matches
   `Read file|Reading file|Viewed image:|Viewing image:|Read|Reading <path>`,
-  and whose last child span's text equals the path's basename. That last span
+  and whose last child span's text equals the path's basename or its
+  trailing segments. That last span
   becomes the link.
+- Skill rows: Codex uses the file headline with a shortened path (the last
+  span is the path's trailing segments, not just the basename). Claude Code
+  uses a `span[title="Loaded skill <name>"]` whose last span is the name; the
+  row id is `<threadId>:tool:<itemId>` and the item is a `toolCall` with
+  `tool: "Skill"`.
+- Search and list rows: `span[title]` is "Searched <rest>" or "Listed
+  <rest>" with two child spans, the last holding the rest ("for Q in P",
+  "matching Q in P", "in P", "files in P"). The plugin splits that text node
+  and wraps only the target in a `span[data-bb-file-links-target]`, which
+  is unwrapped on cleanup.
 - Thumbnails only show for settled rows (`Read file`, `Read`,
   `Viewed image:`), not in-progress ones.
 - Requires the `experimental_threadHeaderAction` slot and

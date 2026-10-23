@@ -1,12 +1,12 @@
-// Works out the directory a shell command was effectively running in when it
-// touched a file: the recorded cwd plus any leading `cd <dir>` steps.
+// Works out the folders a shell command was running in when it touched a
+// file: the recorded cwd plus each `cd <dir>` step.
 //
 // Example: cwd /ws, command `/bin/zsh -lc 'cd ~/repo && sed -n 1,20p a.md'`
 // gives ~/repo (expanded), so a read row for "a.md" means ~/repo/a.md.
 //
-// Only the leading run of `cd` segments joined by `&&` or `;` counts. Anything
-// the parser cannot know for sure (variables, `cd -`, subshells) stops the
-// walk and returns null, so callers fall back to the recorded cwd.
+// Every top-level `cd` counts, in order. Anything the parser cannot know for
+// sure (variables, `cd -`) stops the walk; `cd` inside a subshell, pipeline,
+// or background job is skipped. Callers try each folder, then the cwd.
 import path from "node:path";
 
 type Token = { kind: "word"; value: string } | { kind: "op"; value: string };
@@ -122,39 +122,47 @@ function expandWord(word: string, home: string | null): string | null {
 }
 
 /**
- * Directory after the command's leading `cd` steps, or null when there are
- * none or they cannot be followed.
+ * Folders the command moved into with `cd`, in order. Follows every `cd` in
+ * the top-level chain (`cd a && x; cd b && y` gives [a, b]), so a read in a
+ * later step is found too. Empty when there are none. Stops at a `cd` it
+ * cannot follow, since every folder after it is unknown.
  */
-export function effectiveCommandDir(command: string, cwd: string, home: string | null): string | null {
+export function commandDirs(command: string, cwd: string, home: string | null): string[] {
   let script = command;
   for (let depth = 0; depth <= MAX_UNWRAP; depth++) {
     const tokens = tokenize(script);
-    if (!tokens) return null;
+    if (!tokens) return [];
     const segments = splitSegments(tokens);
     const inner = segments.length === 1 ? shellScript(segments[0].words) : null;
     if (inner !== null) {
       script = inner;
       continue;
     }
+    const dirs: string[] = [];
     let dir = cwd;
-    let changed = false;
+    let parens = 0;
+    let previous: string | null = null;
     for (const segment of segments) {
       const [name, ...args] = segment.words;
-      if (name !== "cd" && name !== "pushd") break;
-      // A piped or backgrounded `cd` runs in a subshell and changes nothing.
-      if (segment.next === "|" || segment.next === "&") break;
+      const isCd = name === "cd" || name === "pushd";
+      // A `cd` in a subshell, pipeline, or background job changes nothing
+      // for the steps after it. (`a & cd x` still runs the cd in this shell.)
+      const contained =
+        parens > 0 || previous === "|" || segment.next === "|" || segment.next === "&";
+      if (segment.next === "(") parens += 1;
+      if (segment.next === ")") parens = Math.max(0, parens - 1);
+      previous = segment.next;
+      if (!isCd || contained) continue;
       const operands = args.filter((arg) => arg !== "-P" && arg !== "-L" && arg !== "--");
-      if (operands.length > 1) return changed ? dir : null;
+      if (operands.length > 1) return dirs;
       const target = operands.length === 0 ? (home ? "~" : null) : operands[0];
-      if (target === null || target === "-") return changed ? dir : null;
+      if (target === null || target === "-") return dirs;
       const expanded = expandWord(target, home);
-      if (expanded === null) return changed ? dir : null;
+      if (expanded === null) return dirs;
       dir = path.posix.resolve(dir, expanded);
-      changed = true;
-      // Only `&&` and `;` carry the new directory into the next segment.
-      if (segment.next !== "&&" && segment.next !== ";") break;
+      if (!dirs.includes(dir)) dirs.push(dir);
     }
-    return changed ? dir : null;
+    return dirs;
   }
-  return null;
+  return [];
 }

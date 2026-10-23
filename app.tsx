@@ -21,7 +21,14 @@
 //   producing command's cwd and leading `cd`.
 // - Its headline is a `span[title]` whose title is the row's plain text, for
 //   example "Read file /abs/path.png" or "Viewed image: rel/path.png", and
-//   whose last child span shows the basename.
+//   whose last child span shows the basename, or the last few path
+//   segments ("bb-orchestration/SKILL.md" for skill files).
+// - Claude Code skill loads: title "Loaded skill <name>", last span <name>,
+//   row id "<threadId>:tool:<itemId>". The backend finds the SKILL.md.
+// - Search and list rows: title "Searched for <q> in <dir>", "Searched
+//   matching <q> in <dir>", "Searched in <dir>", or "Listed files in <dir>",
+//   with everything after the verb in one span. The <dir> text is wrapped in
+//   a link span of our own; the query text is left as is.
 // Everything this file adds is tagged `data-bb-file-links-*` and removed when
 // the content script aborts (disable, reload, window teardown).
 import { useEffect } from "react";
@@ -32,7 +39,7 @@ import {
   useBbNavigate,
   type ExperimentalLiveFileTarget,
 } from "@get-bb/plugin-sdk/app";
-import type { ResolvedFile } from "./server";
+import type { LinkKind, ResolvedFile } from "./server";
 
 const NAVIGATE_EVENT = "bb-file-links:navigate";
 const STYLE_ID = "bb-file-links-styles";
@@ -40,11 +47,17 @@ const LINK_ATTR = "data-bb-file-links-link";
 const THUMB_ATTR = "data-bb-file-links-thumb";
 const OWNED_ATTR = "data-bb-file-links-owned";
 const MISSING_ATTR = "data-bb-file-links-missing";
+// Wrapper around the folder part of a search row; unwrapped on cleanup.
+const TARGET_ATTR = "data-bb-file-links-target";
 
 const ROW_SELECTOR = "[data-timeline-row-id]";
 // Longest prefixes first so "Read file x" is not parsed as "Read" + "file x".
 const HEADLINE_PATTERN =
   /^(Read file|Reading file|Viewed image:|Viewing image:|Read|Reading)\s+(.+)$/;
+const SKILL_PATTERN = /^Loaded skill\s+(.+)$/;
+const SEARCH_PATTERN = /^(?:Searched|Listed)\s+(.+)$/;
+// Glob targets ("*.md", "src/qbo*") are patterns, not one path.
+const GLOB_PATTERN = /[*?[\]{}]/;
 const ROW_ITEM_PATTERN = /^thr_[A-Za-z0-9_]+:[a-z-]+:([A-Za-z0-9_-]{1,120})(?::|$)/;
 const SETTLED_PREFIXES = new Set(["Read file", "Read", "Viewed image:"]);
 const IMAGE_PATTERN = /\.(?:png|jpe?g|gif|webp|svg|bmp)$/i;
@@ -57,6 +70,7 @@ interface NavigateDetail {
 }
 
 interface LinkInfo {
+  kind: LinkKind;
   threadId: string;
   /** Timeline item that produced the row, when the row id carries one. */
   itemId: string | null;
@@ -254,17 +268,68 @@ function threadIdForRow(row: Element): string | null {
   return fromUrl ? fromUrl[1] : null;
 }
 
-/** Parse a headline span into a file reference, or null for other rows. */
-function parseHeadline(headline: HTMLElement): { prefix: string; path: string; name: HTMLElement } | null {
-  const match = HEADLINE_PATTERN.exec(headline.title.trim());
-  if (!match) return null;
-  const [, prefix, filePath] = match;
+type ParsedHeadline =
+  | { kind: "file"; prefix: string; path: string; name: HTMLElement }
+  | { kind: "skill"; path: string; name: HTMLElement }
+  | { kind: "path"; content: HTMLElement; targets: string[] };
+
+/** Whether `shown` is the trailing segments of `filePath` ("x/SKILL.md"). */
+function isPathTail(filePath: string, shown: string): boolean {
+  if (!shown || shown.startsWith("/")) return false;
+  return filePath === shown || filePath.endsWith(`/${shown}`);
+}
+
+/**
+ * Where the folder part of a search row's text may start, latest first.
+ * "for a in b in c" could mean query "a in b" in "c" or query "a" in
+ * "b in c"; the backend's existence check picks between them.
+ */
+function searchTargets(content: string): string[] {
+  const targets: string[] = [];
+  const add = (target: string) => {
+    const trimmed = target.trim();
+    if (trimmed && !GLOB_PATTERN.test(trimmed) && !targets.includes(trimmed)) targets.push(trimmed);
+  };
+  if (/^(?:files\s+)?in\s/.test(content) && !/^(?:for|matching)\s/.test(content)) {
+    add(content.replace(/^(?:files\s+)?in\s+/, ""));
+    return targets;
+  }
+  if (!/^(?:for|matching)\s/.test(content)) return targets;
+  let index = content.lastIndexOf(" in ");
+  while (index > 0 && targets.length < 3) {
+    add(content.slice(index + 4));
+    index = content.lastIndexOf(" in ", index - 1);
+  }
+  return targets;
+}
+
+/** Parse a headline span into a link target, or null for other rows. */
+function parseHeadline(headline: HTMLElement): ParsedHeadline | null {
+  const title = headline.title.trim();
   const name = headline.lastElementChild;
   if (!(name instanceof HTMLElement)) return null;
-  // The visible name must be the path's basename. This rejects rows such as
-  // "Read 3 files" whose title happens to share a prefix.
-  if (name.textContent?.trim() !== basename(filePath)) return null;
-  return { prefix, path: filePath, name };
+  const shown = name.textContent?.trim() ?? "";
+
+  const skill = SKILL_PATTERN.exec(title);
+  if (skill) return shown === skill[1] ? { kind: "skill", path: skill[1], name } : null;
+
+  const search = SEARCH_PATTERN.exec(title);
+  if (search && headline.children.length === 2) {
+    // The whole rest of the title sits in the last span; anything else
+    // ("Searched the web ...") is a different row type.
+    if (shown !== search[1]) return null;
+    const targets = searchTargets(search[1]);
+    return targets.length ? { kind: "path", content: name, targets } : null;
+  }
+
+  const match = HEADLINE_PATTERN.exec(title);
+  if (!match) return null;
+  const [, prefix, filePath] = match;
+  // The visible name must be the path's tail: the basename, or for skill
+  // files "<skill>/SKILL.md". This rejects rows such as "Read 3 files" whose
+  // title happens to share a prefix.
+  if (!isPathTail(filePath, shown)) return null;
+  return { kind: "file", prefix, path: filePath, name };
 }
 
 function ownedElement<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string) {
@@ -306,13 +371,18 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
   }
 
   function lookupInput(info: LinkInfo) {
-    return { threadId: info.threadId, path: info.path, ...(info.itemId ? { itemId: info.itemId } : {}) };
+    return {
+      threadId: info.threadId,
+      path: info.path,
+      ...(info.itemId ? { itemId: info.itemId } : {}),
+      ...(info.kind === "file" ? {} : { kind: info.kind }),
+    };
   }
 
   // One lookup per row (thread + item + path), so virtualized rows that
   // remount while scrolling reuse it.
   function resolve(info: LinkInfo): Promise<ResolvedFile | null> {
-    const key = `${info.threadId}\n${info.itemId ?? ""}\n${info.path}`;
+    const key = `${info.threadId}\n${info.itemId ?? ""}\n${info.kind}\n${info.path}`;
     let pending = resolutions.get(key);
     if (!pending) {
       pending = rpc<ResolvedFile>("resolve", lookupInput(info));
@@ -346,6 +416,10 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
       toast.error("File not found", { description: resolved.absolutePath });
       return;
     }
+    if (resolved.isDirectory) {
+      await openFolder(info);
+      return;
+    }
     if (navigate("preview", info.threadId, resolved.target)) return;
     if (info.isImage) {
       openLightbox(info);
@@ -359,6 +433,10 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
     if (signal.aborted) return;
     if (resolved && !resolved.exists) {
       toast.error("File not found", { description: resolved.absolutePath });
+      return;
+    }
+    if (resolved?.isDirectory) {
+      await openFolder(info);
       return;
     }
     if (!resolved || !navigate("external", info.threadId, resolved.target)) {
@@ -377,7 +455,13 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
 
   async function reveal(info: LinkInfo) {
     const result = await rpc<{ revealed: boolean }>("reveal", lookupInput(info));
-    if (!signal.aborted && !result?.revealed) toast.error("Could not reveal the file in Finder");
+    if (!signal.aborted && !result?.revealed) toast.error("Could not reveal it in Finder");
+  }
+
+  // BB's preview only opens files, so folders open in Finder.
+  async function openFolder(info: LinkInfo) {
+    const result = await rpc<{ revealed: boolean }>("reveal", { ...lookupInput(info), open: true });
+    if (!signal.aborted && !result?.revealed) toast.error("Folders open only when the thread runs on this Mac");
   }
 
   // Context menu --------------------------------------------------------
@@ -401,14 +485,15 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
     root.appendChild(pathLine);
 
     // Everything except Copy waits for the lookup and needs an existing file.
-    const exists = (r: ResolvedFile | null) => r?.exists === true;
+    const isFile = (r: ResolvedFile | null) => r?.exists === true && !r.isDirectory;
     const items: Array<{ label: string; run: () => void; when?: (r: ResolvedFile | null) => boolean }> = [
-      { label: "Open preview", run: () => void openPreview(info), when: exists },
-      { label: "Open in default app", run: () => void openExternally(info), when: exists },
+      { label: "Open folder", run: () => void openFolder(info), when: (r) => r?.isDirectory === true && r.canReveal },
+      { label: "Open preview", run: () => void openPreview(info), when: isFile },
+      { label: "Open in default app", run: () => void openExternally(info), when: isFile },
       { label: "Copy full path", run: () => void copyPath(info) },
       { label: "Reveal in Finder", run: () => void reveal(info), when: (r) => r?.canReveal === true },
     ];
-    if (info.isImage) items.splice(1, 0, { label: "View image", run: () => openLightbox(info), when: exists });
+    if (info.isImage) items.splice(2, 0, { label: "View image", run: () => openLightbox(info), when: isFile });
 
     const buttons: HTMLButtonElement[] = [];
     const revealButtons = new Map<HTMLButtonElement, (r: ResolvedFile | null) => boolean>();
@@ -574,6 +659,89 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
 
   // Row decoration ------------------------------------------------------
 
+  function sameLink(a: LinkInfo, b: LinkInfo): boolean {
+    return a.kind === b.kind && a.path === b.path && a.threadId === b.threadId && a.itemId === b.itemId;
+  }
+
+  function markLink(element: HTMLElement, exists: boolean) {
+    element.setAttribute(LINK_ATTR, "true");
+    element.setAttribute("role", "link");
+    element.setAttribute("tabindex", "0");
+    if (exists) {
+      element.removeAttribute(MISSING_ATTR);
+      element.removeAttribute("aria-disabled");
+    } else {
+      element.setAttribute(MISSING_ATTR, "true");
+      element.setAttribute("aria-disabled", "true");
+    }
+  }
+
+  // Mute names whose file is gone; the menu still offers Copy path.
+  function muteIfMissing(element: HTMLElement, info: LinkInfo) {
+    void resolve(info).then((resolved) => {
+      if (signal.aborted || links.get(element) !== info || !resolved || resolved.exists) return;
+      markLink(element, false);
+    });
+  }
+
+  /** Put the row text back the way React rendered it. */
+  function unwrapTarget(wrapper: Element) {
+    const parent = wrapper.parentNode;
+    if (!parent) return;
+    parent.replaceChild(document.createTextNode(wrapper.textContent ?? ""), wrapper);
+    parent.normalize();
+  }
+
+  const searchKeys = new WeakMap<HTMLElement, string>();
+
+  /**
+   * Wrap the folder at the end of a search row's text in a link. When the
+   * text splits more than one way ("for a in b in c"), the first split whose
+   * path exists wins; if none exists, the last split is shown muted.
+   */
+  function decorateSearchTarget(content: HTMLElement, targets: string[], threadId: string, itemId: string | null) {
+    const key = `${threadId}\n${itemId ?? ""}\n${targets.join("\n")}`;
+    const wrapper = content.querySelector(`:scope > [${TARGET_ATTR}]`);
+    if (searchKeys.get(content) === key && (wrapper || content.dataset.bbFileLinksPending)) return;
+    if (wrapper) unwrapTarget(wrapper);
+    searchKeys.set(content, key);
+    content.dataset.bbFileLinksPending = "1";
+
+    const infos = targets.map<LinkInfo>((target) => ({ kind: "path", threadId, itemId, path: target, isImage: false }));
+    void (async () => {
+      let chosen = infos[0];
+      let found = false;
+      let answered = false;
+      for (const info of infos) {
+        const resolved = await resolve(info);
+        answered ||= resolved !== null;
+        if (resolved?.exists) {
+          chosen = info;
+          found = true;
+          break;
+        }
+      }
+      // No answer at all (backend down, thread unknown): leave the text
+      // alone and keep the marker so rescans do not retry in a loop.
+      if (!answered) return;
+      delete content.dataset.bbFileLinksPending;
+      if (signal.aborted || searchKeys.get(content) !== key || !content.isConnected) return;
+      // React may have re-rendered the text meanwhile; only wrap a single
+      // text node that still ends with the target.
+      const text = content.firstChild;
+      if (content.childNodes.length !== 1 || !(text instanceof Text)) return;
+      const value = text.data;
+      if (!value.endsWith(chosen.path)) return;
+      const tail = text.splitText(value.length - chosen.path.length);
+      const link = document.createElement("span");
+      link.setAttribute(TARGET_ATTR, "true");
+      content.replaceChild(link, tail);
+      link.appendChild(tail);
+      links.set(link, chosen);
+      markLink(link, found);
+    })();
+  }
+
   function decorateRow(row: HTMLElement) {
     const threadId = threadIdForRow(row);
     let thumbFor: LinkInfo | null = null;
@@ -584,34 +752,34 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
         if (headline.closest(ROW_SELECTOR) !== row) continue;
         const parsed = parseHeadline(headline);
         if (!parsed) continue;
+        const itemId = itemIdForRow(row);
+        if (parsed.kind === "path") {
+          decorateSearchTarget(parsed.content, parsed.targets, threadId, itemId);
+          break;
+        }
         const info: LinkInfo = {
+          kind: parsed.kind,
           threadId,
-          itemId: itemIdForRow(row),
+          itemId,
           path: parsed.path,
-          isImage: IMAGE_PATTERN.test(parsed.path),
+          isImage: parsed.kind === "file" && IMAGE_PATTERN.test(parsed.path),
         };
         const existing = links.get(parsed.name);
-        if (
-          !existing ||
-          existing.path !== info.path ||
-          existing.threadId !== threadId ||
-          existing.itemId !== info.itemId
-        ) {
-          const name = parsed.name;
-          links.set(name, info);
-          name.setAttribute(LINK_ATTR, "true");
-          name.setAttribute("role", "link");
-          name.setAttribute("tabindex", "0");
-          name.removeAttribute(MISSING_ATTR);
-          name.removeAttribute("aria-disabled");
-          // Mute names whose file is gone; the menu still offers Copy path.
-          void resolve(info).then((resolved) => {
-            if (signal.aborted || links.get(name) !== info || !resolved || resolved.exists) return;
-            name.setAttribute(MISSING_ATTR, "true");
-            name.setAttribute("aria-disabled", "true");
-          });
+        if (!existing || !sameLink(existing, info)) {
+          links.set(parsed.name, info);
+          if (parsed.kind === "skill") {
+            // Only the backend knows which SKILL.md was loaded; link once it does.
+            const name = parsed.name;
+            void resolve(info).then((resolved) => {
+              if (signal.aborted || links.get(name) !== info || !resolved) return;
+              markLink(name, resolved.exists);
+            });
+          } else {
+            markLink(parsed.name, true);
+            muteIfMissing(parsed.name, info);
+          }
         }
-        if (info.isImage && SETTLED_PREFIXES.has(parsed.prefix)) thumbFor = info;
+        if (info.isImage && parsed.kind === "file" && SETTLED_PREFIXES.has(parsed.prefix)) thumbFor = info;
         break;
       }
     }
@@ -728,6 +896,10 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
       element.removeAttribute("tabindex");
     }
     for (const element of document.querySelectorAll(`[${OWNED_ATTR}]`)) element.remove();
+    for (const element of document.querySelectorAll(`[${TARGET_ATTR}]`)) unwrapTarget(element);
+    for (const element of document.querySelectorAll<HTMLElement>("[data-bb-file-links-pending]")) {
+      delete element.dataset.bbFileLinksPending;
+    }
     style.remove();
   };
 }

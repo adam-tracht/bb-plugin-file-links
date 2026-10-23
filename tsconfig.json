@@ -19,6 +19,7 @@
   "include": [
     "server.ts",
     "shell-cwd.ts",
+    "claude-skills.ts",
     "app.tsx"
   ]
 }
