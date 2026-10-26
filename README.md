@@ -45,7 +45,14 @@ for X in src/lib", "Listed files in ~/.bb").
   checked and the first one that exists wins. Folders only open when the
   thread runs on this Mac; on a remote machine a folder cannot be checked
   for existence, so it is assumed to exist.
-- Images inside chat messages are left alone (image-preview handles those).
+- **Image links in chat messages** (`[chart.png](/abs/chart.png)`, which BB
+  renders as a `file://` link) get one thumbnail at the end of the link's
+  paragraph or list item; click it for the same lightbox. Relative links
+  resolve against the thread's environment folder. Missing files get no
+  thumbnail. Markdown images (`![alt](x.png)`, which BB already renders with
+  its own lightbox), http(s) links, and the composer are left alone. This
+  replaces the Dwite image-preview plugin, which pointed `<img src>` at the
+  link's `file://` href and showed a broken image.
 
 ## How it works
 
@@ -113,6 +120,11 @@ for X in src/lib", "Listed files in ~/.bb").
   "matching Q in P", "in P", "files in P"). The plugin splits that text node
   and wraps only the target in a `span[data-bb-file-links-target]`, which
   is unwrapped on cleanup.
+- Chat messages: markdown renders in `[data-markdown-preview]` inside a
+  timeline row; local links are `a[href^="file:"]` (scheme-less hrefs are
+  accepted too). The thumbnail is a `span[data-bb-file-links-message-thumb]`
+  appended to the anchor's closest `p`, `li`, `td`, or heading, and is
+  dropped when React replaces the anchor.
 - Thumbnails only show for settled rows (`Read file`, `Read`,
   `Viewed image:`), not in-progress ones.
 - Requires the `experimental_threadHeaderAction` slot and

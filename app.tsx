@@ -29,6 +29,10 @@
 //   matching <q> in <dir>", "Searched in <dir>", or "Listed files in <dir>",
 //   with everything after the verb in one span. The <dir> text is wrapped in
 //   a link span of our own; the query text is left as is.
+// - Chat messages: markdown renders inside `[data-markdown-preview]` in a
+//   timeline row; a local file link is an `<a href="file:///abs/path">` (or a
+//   scheme-less path). Image links get a thumbnail span appended to the
+//   link's paragraph or list item. Markdown `<img>` and http(s) links are left to BB.
 // Everything this file adds is tagged `data-bb-file-links-*` and removed when
 // the content script aborts (disable, reload, window teardown).
 import { useEffect } from "react";
@@ -49,6 +53,8 @@ const OWNED_ATTR = "data-bb-file-links-owned";
 const MISSING_ATTR = "data-bb-file-links-missing";
 // Wrapper around the folder part of a search row; unwrapped on cleanup.
 const TARGET_ATTR = "data-bb-file-links-target";
+// Thumbnail for an image link in a chat message; value is the link's key.
+const MESSAGE_THUMB_ATTR = "data-bb-file-links-message-thumb";
 
 const ROW_SELECTOR = "[data-timeline-row-id]";
 // Longest prefixes first so "Read file x" is not parsed as "Read" + "file x".
@@ -103,6 +109,10 @@ const styles = `
   .bb-file-links-thumb-wrap {
     display: block;
     padding: 0.25rem 0 0.375rem 1.25rem;
+  }
+  .bb-file-links-message-thumb-wrap {
+    display: block;
+    padding: 0.375rem 0;
   }
   .bb-file-links-thumb {
     display: block;
@@ -330,6 +340,32 @@ function parseHeadline(headline: HTMLElement): ParsedHeadline | null {
   // title happens to share a prefix.
   if (!isPathTail(filePath, shown)) return null;
   return { kind: "file", prefix, path: filePath, name };
+}
+
+/**
+ * Local image path behind a chat message link, or null. Accepts
+ * `file:///abs/x.png` and scheme-less paths ("/abs/x.png", "out/x.png");
+ * any other scheme (http, https, mailto) is skipped.
+ */
+function localImagePath(href: string): string | null {
+  let filePath: string;
+  if (/^file:/i.test(href)) {
+    try {
+      filePath = decodeURIComponent(new URL(href).pathname);
+    } catch {
+      return null;
+    }
+  } else if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("//") || href.startsWith("#")) {
+    return null;
+  } else {
+    const bare = href.replace(/[?#].*$/, "");
+    try {
+      filePath = decodeURIComponent(bare);
+    } catch {
+      filePath = bare;
+    }
+  }
+  return filePath && IMAGE_PATTERN.test(filePath) ? filePath : null;
 }
 
 function ownedElement<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string) {
@@ -812,8 +848,85 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
     row.appendChild(wrap);
   }
 
+  // Each image link's thumbnail goes at the end of the link's paragraph or
+  // list item, so it never splits a sentence. React may re-render the anchor;
+  // a thumbnail only lives while its anchor is still on the page.
+  interface MessageThumb {
+    key: string;
+    wrap: HTMLElement | null;
+  }
+  const messageThumbs = new WeakMap<HTMLAnchorElement, MessageThumb>();
+  const thumbAnchors = new WeakMap<HTMLElement, HTMLAnchorElement>();
+
+  function messageBlock(anchor: HTMLAnchorElement): HTMLElement | null {
+    return anchor.closest<HTMLElement>("p, li, td, th, h1, h2, h3, h4, h5, h6, [data-markdown-preview]");
+  }
+
+  function decorateMessageLink(anchor: HTMLAnchorElement, threadId: string) {
+    const record = messageThumbs.get(anchor);
+    // Linked images (`[![alt](x.png)](x.png)`) already show the image.
+    const filePath = anchor.querySelector("img") ? null : localImagePath(anchor.getAttribute("href") ?? "");
+    const key = filePath ? `${threadId}\n${filePath}` : "";
+    if (record?.key === key) return; // shown, still resolving, or known missing
+    record?.wrap?.remove();
+    if (!filePath) {
+      messageThumbs.delete(anchor);
+      return;
+    }
+    const entry: MessageThumb = { key, wrap: null };
+    messageThumbs.set(anchor, entry);
+
+    // Relative paths resolve against the environment folder (no item id).
+    const info: LinkInfo = { kind: "file", threadId, itemId: null, path: filePath, isImage: true };
+    void resolve(info).then((resolved) => {
+      if (signal.aborted || !anchor.isConnected || messageThumbs.get(anchor) !== entry) return;
+      if (!resolved) {
+        messageThumbs.delete(anchor); // lookup failed; retry on a later scan
+        return;
+      }
+      const block = messageBlock(anchor);
+      if (!resolved.exists || resolved.isDirectory || !block) return;
+      const wrap = ownedElement("span", "bb-file-links-message-thumb-wrap");
+      wrap.setAttribute(MESSAGE_THUMB_ATTR, key);
+      const image = ownedElement("img", "bb-file-links-thumb");
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.alt = basename(filePath);
+      image.title = resolved.absolutePath;
+      image.tabIndex = 0;
+      image.setAttribute("role", "button");
+      image.setAttribute("aria-label", `View image: ${basename(filePath)}`);
+      // A missing or unreadable file leaves no broken-image box behind.
+      image.addEventListener("error", () => wrap.remove(), { once: true });
+      image.src = imageUrl(info);
+      links.set(image, info);
+      wrap.appendChild(image);
+      block.appendChild(wrap);
+      entry.wrap = wrap;
+      thumbAnchors.set(wrap, anchor);
+    });
+  }
+
+  function scanMessages() {
+    for (const anchor of document.querySelectorAll<HTMLAnchorElement>(
+      `${ROW_SELECTOR} [data-markdown-preview] a[href]`,
+    )) {
+      const threadId = threadIdForRow(anchor.closest(ROW_SELECTOR)!);
+      if (threadId) decorateMessageLink(anchor, threadId);
+    }
+    // Drop thumbnails whose anchor was re-rendered, removed, or moved.
+    for (const thumb of document.querySelectorAll<HTMLElement>(`[${MESSAGE_THUMB_ATTR}]`)) {
+      const anchor = thumbAnchors.get(thumb);
+      if (!anchor?.isConnected || messageThumbs.get(anchor)?.wrap !== thumb || messageBlock(anchor) !== thumb.parentElement) {
+        thumb.remove();
+        if (anchor && messageThumbs.get(anchor)?.wrap === thumb) messageThumbs.delete(anchor);
+      }
+    }
+  }
+
   function scan() {
     for (const row of document.querySelectorAll<HTMLElement>(ROW_SELECTOR)) decorateRow(row);
+    scanMessages();
   }
 
   let frame = 0;
@@ -829,7 +942,7 @@ function mountFileLinks(pluginId: string, signal: AbortSignal) {
     subtree: true,
     characterData: true,
     attributes: true,
-    attributeFilter: ["title", "data-timeline-row-id"],
+    attributeFilter: ["title", "data-timeline-row-id", "href"],
   });
   scan();
 

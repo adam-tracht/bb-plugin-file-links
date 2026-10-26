@@ -30,6 +30,11 @@ Source: https://github.com/adam-tracht/bb-plugin-file-links (local clone:
   the target P in `span[data-bb-file-links-target]`; globs stay plain.
   Folders resolve with `kind: "path"` and open through RPC `reveal` with
   `open: true`. Relative paths try every top-level `cd` in the command.
+- Chat messages: image links (`a[href^="file:"]` inside
+  `[data-markdown-preview]`) get one `span[data-bb-file-links-message-thumb]`
+  at the end of their paragraph or list item, only when RPC `resolve` says the
+  file exists. Markdown `<img>`, http(s) links, and the composer are skipped.
+  Check on thr_2uwkdftncd (recap PNG link).
 - Thumbnails load from `/api/v1/plugins/file-links/http/image`, which only
   serves image extensions under 20 MB.
 - Check after changes: `bb plugin build . && bb plugin reload file-links`,
